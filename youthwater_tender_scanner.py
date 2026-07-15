@@ -532,7 +532,7 @@ def main():
     cache = prune_seen_cache(load_seen_cache())
 
     strong, possible = [], []
-    new_count = 0
+    pending_hashes = []  # relevant tenders -- only marked seen after a successful send
 
     for tender in tenders:
         h = tender_hash(tender)
@@ -540,12 +540,14 @@ def main():
             continue
 
         result = score_tender(tender)
-        cache[h] = datetime.utcnow().isoformat()
 
         if result is None:
+            # Irrelevant/excluded tenders are safe to cache immediately -- this
+            # only avoids re-scoring cost and never affects email delivery.
+            cache[h] = datetime.utcnow().isoformat()
             continue
 
-        new_count += 1
+        pending_hashes.append(h)
         if result["tier"] == "Strong Fit":
             strong.append(result)
         else:
@@ -554,18 +556,30 @@ def main():
     strong.sort(key=lambda r: r["total_score"], reverse=True)
     possible.sort(key=lambda r: r["total_score"], reverse=True)
 
+    new_count = len(pending_hashes)
     log.info(f"Filtered: {new_count} new & relevant ({len(strong)} strong, {len(possible)} possible)")
 
-    save_seen_cache(cache)
-
     if new_count == 0:
+        save_seen_cache(cache)
         log.info("No new relevant tenders -- skipping email")
         return
 
     run_date = datetime.utcnow().strftime("%Y-%m-%d")
     subject = f"Youth Water Tender Intelligence -- {run_date} | {len(strong)} Strong, {len(possible)} Possible"
     html = build_email_html(strong, possible, run_date)
-    send_email(subject, html)
+    sent = send_email(subject, html)
+
+    if sent:
+        now = datetime.utcnow().isoformat()
+        for h in pending_hashes:
+            cache[h] = now
+    else:
+        log.warning(
+            "Email send failed -- relevant tenders NOT marked as seen; "
+            "they will be retried on the next run instead of being lost."
+        )
+
+    save_seen_cache(cache)
 
 
 if __name__ == "__main__":
