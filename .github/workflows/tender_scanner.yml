@@ -1,0 +1,44 @@
+name: Youth Water Tender Scanner
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+    - cron: "0 11 * * *"
+    - cron: "0 16 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run tender scanner
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python youthwater_tender_scanner.py
+
+      - name: Commit updated dedupe cache
+        run: |
+          git config user.name "youthwater-tender-scanner-bot"
+          git config user.email "actions@github.com"
+          git add seen_tenders.json
+          if git diff --cached --quiet; then
+            echo "No changes to seen_tenders.json"
+          else
+            git commit -m "Update seen_tenders cache [skip ci]"
+            git push
+          fi
