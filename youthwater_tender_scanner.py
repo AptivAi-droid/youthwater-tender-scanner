@@ -48,6 +48,7 @@ import sys
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import quote
 
 import requests
 
@@ -446,7 +447,7 @@ CARD_TEMPLATE = """
   </div>
   <div style="margin-top:10px;">
     <a href="{portal_url}" style="font-size:13px;color:#0b5fff;text-decoration:none;">
-      View on eTenders portal &rarr;</a>
+      {link_text} &rarr;</a>
   </div>
 </div>
 """
@@ -456,9 +457,37 @@ def _fmt_hits(hits):
     return ", ".join(hits) if hits else "none"
 
 
+def document_url(tender):
+    """Build a genuine per-tender document link from the API's own
+    supportDocument GUID + extension, falling back to the portal listing
+    page when no document is attached to the tender.
+
+    Note (carried over from Aptiv's own scanner, verified independently):
+    this direct download link works reliably when fetched programmatically,
+    but the portal has shown intermittent 503s on a cold top-level browser
+    navigation to it (likely bot/hotlink protection) -- not something we can
+    fix from this script. The listing-page fallback below is the guaranteed
+    path when either no document exists or the link itself misbehaves.
+    """
+    docs = tender.get("supportDocument") or []
+    if not docs:
+        return TENDER_PORTAL_URL, False
+    doc = docs[0]
+    doc_id = doc.get("supportDocumentID")
+    ext = doc.get("extension") or ""
+    filename = doc.get("fileName") or "tender_document"
+    if not doc_id:
+        return TENDER_PORTAL_URL, False
+    blob_name = f"{doc_id}{ext}"
+    url = f"{DOWNLOAD_BASE_URL}?blobName={quote(blob_name)}&downloadedFileName={quote(filename)}"
+    return url, True
+
+
 def build_card(result):
     tender = result["tender"]
     border_color = "#1a7f37" if result["tier"] == "Strong Fit" else "#b8860b"
+    link_url, has_doc = document_url(tender)
+    link_text = "View tender document" if has_doc else "View on eTenders portal (search this tender)"
     return CARD_TEMPLATE.format(
         border_color=border_color,
         tier=result["tier"],
@@ -473,7 +502,8 @@ def build_card(result):
         service_hits=_fmt_hits(result["breakdown"]["service_match"]["hits"]),
         strategic_hits=_fmt_hits(result["breakdown"]["strategic_fit"]["hits"]),
         consortium_hits=_fmt_hits(result["breakdown"]["consortium_advantage"]["hits"]),
-        portal_url=TENDER_PORTAL_URL,
+        portal_url=link_url,
+        link_text=link_text,
     )
 
 
