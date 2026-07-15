@@ -77,6 +77,8 @@ RECIPIENTS = [
     "keisha.ash@krosworx.co.za",
     "liam.dalton@inkrow.co.za",
     "keisha@youthwater.co.za",
+    "oliver.bailey@krosworx.co.za",
+    "prayleen.bailey1@gmail.com",
 ]
 
 # --- Scoring thresholds & weights -------------------------------------------
