@@ -10,31 +10,42 @@ Water's service offering (bottled water supply, catering, hospitality, events),
 scores them for strategic fit, and emails an HTML digest of Strong/Possible matches.
 
 Architecture mirrors Aptiv's own aptiv_tender_scanner.py:
-  - JSON API only, no HTML scraping / bs4
-  - MD5-hash dedupe cache (id|title|number) committed back to the repo each run
-  - SMTP over SSL (port 465), not STARTTLS
-  - Runs 3x/day via GitHub Actions cron
+- JSON API only, no HTML scraping / bs4
+- MD5-hash dedupe cache (id|title|number) committed back to the repo each run
+- SMTP over SSL (port 465), not STARTTLS
+- Runs 3x/day via GitHub Actions cron
 
 CHANGE LOG
 ----------
-2026-07-15  v1.0  Initial build for Youth Water. Forked from Aptiv's scanner
-                  architecture. Category allowlist rebuilt from scratch (does NOT
-                  reuse Aptiv's professional-services allowlist -- see section 5
-                  of the build spec). Score weights reweighted 35/25/20/20 (vs
-                  Aptiv's 40/30/20/10) per Neal's call: B-BBEE/youth-ownership is
-                  Youth Water's primary competitive edge, not a secondary bonus.
-                  Feasibility rebuilt as a multi-province coverage model (Western
-                  Cape / Eastern Cape / Gauteng) instead of Aptiv's single
-                  HOME_PROVINCE model, since Youth Water delivers physical goods
-                  across three provinces with no single stated HQ.
+2026-07-15 v1.0  Initial build for Youth Water. Forked from Aptiv's scanner
+                 architecture. Category allowlist rebuilt from scratch (does NOT
+                 reuse Aptiv's professional-services allowlist -- see section 5
+                 of the build spec). Score weights reweighted 35/25/20/20 (vs
+                 Aptiv's 40/30/20/10) per Neal's call: B-BBEE/youth-ownership is
+                 Youth Water's primary competitive edge, not a secondary bonus.
+                 Feasibility rebuilt as a multi-province coverage model (Western
+                 Cape / Eastern Cape / Gauteng) instead of Aptiv's single
+                 HOME_PROVINCE model, since Youth Water delivers physical goods
+                 across three provinces with no single stated HQ.
+2026-07-16 v1.1  Fix: fetch_tenders() was issuing a single API call capped at
+                 length=300 with no pagination loop, silently dropping every
+                 tender past the first page. Verified live on 2026-07-16 against
+                 Aptiv's own scanner run in the same window: the portal returned
+                 1,865 total advertised tenders, of which Youth Water's scanner
+                 was only ever seeing the first 300 (~16%). Replaced with the
+                 same paginated fetch loop Aptiv's scanner uses (500-record
+                 pages, looping until recordsTotal is exhausted), so the two
+                 scanners now have identical fetch coverage of the portal --
+                 only scoring/category logic differs, per the 2026-07-15 design
+                 decision above. No other behavior changed.
 
 OPEN ITEMS (see build spec section 10 -- confirm before treating output as final):
-  - Youth Water's physical base/warehouse location is not stated in the source
-    docs; FEASIBILITY_PROVINCE_POINTS below treats all three coverage provinces
-    equally rather than weighting Western Cape higher for track record.
-  - Category allowlist (section 5) is built from the live eTenders Advanced
-    Search filter list as of 2026-07-15 -- re-verify periodically, categories on
-    government portals do get renamed/added.
+- Youth Water's physical base/warehouse location is not stated in the source
+  docs; FEASIBILITY_PROVINCE_POINTS below treats all three coverage provinces
+  equally rather than weighting Western Cape higher for track record.
+- Category allowlist (section 5) is built from the live eTenders Advanced
+  Search filter list as of 2026-07-15 -- re-verify periodically, categories on
+  government portals do get renamed/added.
 """
 
 import hashlib
@@ -45,6 +56,7 @@ import re
 import smtplib
 import ssl
 import sys
+import time
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -247,41 +259,68 @@ EXCLUSIONS = [
 # FETCH
 # ---------------------------------------------------------------------------
 
-
 def fetch_tenders():
-    """Pull currently-advertised tenders from the eTenders JSON API.
+    """Pull ALL currently-advertised tenders from the eTenders JSON API.
 
-    Uses the same DataTables-style query the portal's own front-end issues:
-    status=1 (advertised/open only), length=300. We sort client-side by
-    date_Published desc afterward rather than relying on server-side order
-    params, which keeps this resilient to DataTables column-index changes.
+    v1.1 fix: paginates in batches of 500 until the portal's own recordsTotal
+    is exhausted -- mirrors Aptiv's fetch_all_tenders() exactly. The original
+    v1.0 version issued a single request with length=300 and no loop, which
+    silently truncated results to the first 300 records returned by the
+    portal (verified live on 2026-07-16: the portal had 1,865 total
+    advertised tenders at the time, so v1.0 was only ever seeing ~16% of the
+    open tenders on any given run).
     """
-    params = {
-        "draw": 1,
-        "start": 0,
-        "length": 300,
-        "status": 1,
-    }
     log.info("Fetching tenders from eTenders API...")
-    resp = requests.get(TENDER_API_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    payload = resp.json()
-    tenders = payload.get("data", [])
-    tenders.sort(key=lambda t: t.get("date_Published") or "", reverse=True)
-    log.info(f"Fetched {len(tenders)} tenders")
-    return tenders
+    session = requests.Session()
+    all_tenders = []
+    page_size = 500
+    start = 0
+    draw = 1
 
+    while True:
+        params = {
+            "draw": draw,
+            "start": start,
+            "length": page_size,
+            "search[value]": "",
+            "search[regex]": "false",
+            "order[0][column]": 4,  # date_Published
+            "order[0][dir]": "desc",
+            "status": 1,  # Advertised/Open
+            "_": int(time.time() * 1000),
+        }
+        try:
+            resp = session.get(TENDER_API_URL, params=params, timeout=45)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            log.warning(f"Fetch error at start={start}: {e}")
+            break
+
+        records = payload.get("data", [])
+        total = payload.get("recordsTotal", 0)
+        all_tenders.extend(records)
+
+        if start + page_size >= total:
+            break
+        start += page_size
+        draw += 1
+        time.sleep(0.5)
+
+    # Client-side sort as a safety net -- resilient to DataTables column-index
+    # changes even though we also pass order[] params server-side above.
+    all_tenders.sort(key=lambda t: t.get("date_Published") or "", reverse=True)
+    log.info(f"Fetched {len(all_tenders)} tenders")
+    return all_tenders
 
 # ---------------------------------------------------------------------------
 # DEDUPE CACHE
 # ---------------------------------------------------------------------------
 
-
 def tender_hash(tender):
     """MD5 hash of id|title|number -- same dedupe key pattern as Aptiv's scanner."""
     key = f"{tender.get('id')}|{tender.get('description')}|{tender.get('tender_No')}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()
-
 
 def load_seen_cache():
     if not os.path.exists(SEEN_CACHE_FILE):
@@ -292,7 +331,6 @@ def load_seen_cache():
     except (json.JSONDecodeError, OSError) as e:
         log.warning(f"Could not read {SEEN_CACHE_FILE} ({e}); starting fresh")
         return {}
-
 
 def prune_seen_cache(cache):
     """Drop entries older than CACHE_RETENTION_DAYS to keep the cache file small."""
@@ -306,31 +344,25 @@ def prune_seen_cache(cache):
             continue
     return pruned
 
-
 def save_seen_cache(cache):
     with open(SEEN_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, sort_keys=True)
-
 
 # ---------------------------------------------------------------------------
 # SCORING
 # ---------------------------------------------------------------------------
 
-
 def _contains_any(haystack, needles):
     return [n for n in needles if n in haystack]
 
-
 def is_excluded(text):
     return any(term in text for term in EXCLUSIONS)
-
 
 def passes_category_filter(tender, text):
     category = (tender.get("category") or "").strip()
     if category in CATEGORY_ALLOWLIST:
         return True
     return any(kw in text for kw in SERVICE_MATCH_OVERRIDE_KEYWORDS)
-
 
 def score_service_match(text):
     matched = [(kw, pts) for kw, pts in SERVICE_MATCH_KEYWORDS.items() if kw in text]
@@ -339,12 +371,10 @@ def score_service_match(text):
     score = min(SCORE_WEIGHTS["service_match"], max(pts for _, pts in matched))
     return score, [kw for kw, _ in matched]
 
-
 def score_strategic_fit(text):
     matched = _contains_any(text, STRATEGIC_FIT_KEYWORDS)
     score = min(SCORE_WEIGHTS["strategic_fit"], len(matched) * STRATEGIC_FIT_POINTS_PER_MATCH)
     return score, matched
-
 
 def score_feasibility(tender):
     province = (tender.get("province") or "").strip()
@@ -381,12 +411,10 @@ def score_feasibility(tender):
     score = min(SCORE_WEIGHTS["feasibility"], province_pts + timeline_pts)
     return score, {"province_bucket": bucket, "timeline_bucket": timeline_bucket, "days_left": days_left}
 
-
 def score_consortium(text):
     matched = _contains_any(text, CONSORTIUM_SIGNALS)
     score = min(SCORE_WEIGHTS["consortium_advantage"], len(matched) * CONSORTIUM_POINTS_PER_MATCH)
     return score, matched
-
 
 def score_tender(tender):
     description = (tender.get("description") or "")
@@ -422,40 +450,37 @@ def score_tender(tender):
         },
     }
 
-
 # ---------------------------------------------------------------------------
 # EMAIL
 # ---------------------------------------------------------------------------
 
 CARD_TEMPLATE = """
 <div style="border:1px solid #ddd;border-left:6px solid {border_color};border-radius:6px;
-            padding:16px;margin-bottom:14px;font-family:Arial,Helvetica,sans-serif;">
-  <div style="font-size:12px;font-weight:bold;color:{border_color};text-transform:uppercase;
-              letter-spacing:0.5px;margin-bottom:6px;">{tier} &middot; {score}/100</div>
-  <div style="font-size:15px;font-weight:bold;color:#1a1a1a;margin-bottom:6px;">{description}</div>
-  <div style="font-size:13px;color:#555;margin-bottom:8px;">
-    <strong>Tender No:</strong> {tender_no} &nbsp;|&nbsp;
-    <strong>Organ of State:</strong> {organ} &nbsp;|&nbsp;
-    <strong>Province:</strong> {province}<br/>
-    <strong>Category:</strong> {category} &nbsp;|&nbsp;
-    <strong>Closing:</strong> {closing} &nbsp;|&nbsp;
-    <strong>Published:</strong> {published}
-  </div>
-  <div style="font-size:12px;color:#777;">
-    Service match: {service_hits} &nbsp;|&nbsp; Strategic fit: {strategic_hits} &nbsp;|&nbsp;
-    Consortium signals: {consortium_hits}
-  </div>
-  <div style="margin-top:10px;">
-    <a href="{portal_url}" style="font-size:13px;color:#0b5fff;text-decoration:none;">
-      {link_text} &rarr;</a>
-  </div>
+padding:16px;margin-bottom:14px;font-family:Arial,Helvetica,sans-serif;">
+<div style="font-size:12px;font-weight:bold;color:{border_color};text-transform:uppercase;
+letter-spacing:0.5px;margin-bottom:6px;">{tier} &middot; {score}/100</div>
+<div style="font-size:15px;font-weight:bold;color:#1a1a1a;margin-bottom:6px;">{description}</div>
+<div style="font-size:13px;color:#555;margin-bottom:8px;">
+<strong>Tender No:</strong> {tender_no} &nbsp;|&nbsp;
+<strong>Organ of State:</strong> {organ} &nbsp;|&nbsp;
+<strong>Province:</strong> {province}<br/>
+<strong>Category:</strong> {category} &nbsp;|&nbsp;
+<strong>Closing:</strong> {closing} &nbsp;|&nbsp;
+<strong>Published:</strong> {published}
+</div>
+<div style="font-size:12px;color:#777;">
+Service match: {service_hits} &nbsp;|&nbsp; Strategic fit: {strategic_hits} &nbsp;|&nbsp;
+Consortium signals: {consortium_hits}
+</div>
+<div style="margin-top:10px;">
+<a href="{portal_url}" style="font-size:13px;color:#0b5fff;text-decoration:none;">
+{link_text} &rarr;</a>
+</div>
 </div>
 """
 
-
 def _fmt_hits(hits):
     return ", ".join(hits) if hits else "none"
-
 
 def document_url(tender):
     """Build a genuine per-tender document link from the API's own
@@ -482,7 +507,6 @@ def document_url(tender):
     url = f"{DOWNLOAD_BASE_URL}?blobName={quote(blob_name)}&downloadedFileName={quote(filename)}"
     return url, True
 
-
 def build_card(result):
     tender = result["tender"]
     border_color = "#1a7f37" if result["tier"] == "Strong Fit" else "#b8860b"
@@ -506,30 +530,28 @@ def build_card(result):
         link_text=link_text,
     )
 
-
 def build_email_html(strong, possible, run_date):
     strong_cards = "".join(build_card(r) for r in strong) or "<p>None today.</p>"
     possible_cards = "".join(build_card(r) for r in possible) or "<p>None today.</p>"
     return f"""
-    <html>
-    <body style="background:#f4f4f4;padding:20px;font-family:Arial,Helvetica,sans-serif;">
-      <div style="max-width:680px;margin:0 auto;background:#fff;padding:24px;border-radius:8px;">
-        <h2 style="color:#1a1a1a;margin-bottom:4px;">Youth Water Tender Intelligence</h2>
-        <p style="color:#777;margin-top:0;">{run_date} &middot; {len(strong)} Strong, {len(possible)} Possible</p>
-        <h3 style="color:#1a7f37;">Strong Fit ({len(strong)})</h3>
-        {strong_cards}
-        <h3 style="color:#b8860b;">Possible Fit ({len(possible)})</h3>
-        {possible_cards}
-        <p style="font-size:11px;color:#999;margin-top:24px;">
-          Automated scan of the eTenders national portal. Scoring weights: Service Match 35,
-          Strategic Fit 25, Feasibility 20, Consortium Advantage 20. Thresholds: Strong &ge; 55,
-          Possible &ge; 25.
-        </p>
-      </div>
-    </body>
-    </html>
-    """
-
+<html>
+<body style="background:#f4f4f4;padding:20px;font-family:Arial,Helvetica,sans-serif;">
+<div style="max-width:680px;margin:0 auto;background:#fff;padding:24px;border-radius:8px;">
+<h2 style="color:#1a1a1a;margin-bottom:4px;">Youth Water Tender Intelligence</h2>
+<p style="color:#777;margin-top:0;">{run_date} &middot; {len(strong)} Strong, {len(possible)} Possible</p>
+<h3 style="color:#1a7f37;">Strong Fit ({len(strong)})</h3>
+{strong_cards}
+<h3 style="color:#b8860b;">Possible Fit ({len(possible)})</h3>
+{possible_cards}
+<p style="font-size:11px;color:#999;margin-top:24px;">
+Automated scan of the eTenders national portal. Scoring weights: Service Match 35,
+Strategic Fit 25, Feasibility 20, Consortium Advantage 20. Thresholds: Strong &ge; 55,
+Possible &ge; 25.
+</p>
+</div>
+</body>
+</html>
+"""
 
 def send_email(subject, html_body):
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
@@ -553,11 +575,9 @@ def send_email(subject, html_body):
         log.error(f"Failed to send email: {e}")
         return False
 
-
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
-
 
 def main():
     tenders = fetch_tenders()
@@ -612,7 +632,6 @@ def main():
         )
 
     save_seen_cache(cache)
-
 
 if __name__ == "__main__":
     main()
