@@ -17,35 +17,62 @@ Architecture mirrors Aptiv's own aptiv_tender_scanner.py:
 
 CHANGE LOG
 ----------
-2026-07-15 v1.0  Initial build for Youth Water. Forked from Aptiv's scanner
-                 architecture. Category allowlist rebuilt from scratch (does NOT
-                 reuse Aptiv's professional-services allowlist -- see section 5
-                 of the build spec). Score weights reweighted 35/25/20/20 (vs
-                 Aptiv's 40/30/20/10) per Neal's call: B-BBEE/youth-ownership is
-                 Youth Water's primary competitive edge, not a secondary bonus.
-                 Feasibility rebuilt as a multi-province coverage model (Western
-                 Cape / Eastern Cape / Gauteng) instead of Aptiv's single
-                 HOME_PROVINCE model, since Youth Water delivers physical goods
-                 across three provinces with no single stated HQ.
-2026-07-16 v1.1  Fix: fetch_tenders() was issuing a single API call capped at
-                 length=300 with no pagination loop, silently dropping every
-                 tender past the first page. Verified live on 2026-07-16 against
-                 Aptiv's own scanner run in the same window: the portal returned
-                 1,865 total advertised tenders, of which Youth Water's scanner
-                 was only ever seeing the first 300 (~16%). Replaced with the
-                 same paginated fetch loop Aptiv's scanner uses (500-record
-                 pages, looping until recordsTotal is exhausted), so the two
-                 scanners now have identical fetch coverage of the portal --
-                 only scoring/category logic differs, per the 2026-07-15 design
-                 decision above. No other behavior changed.
+2026-07-15 v1.0 Initial build for Youth Water. Forked from Aptiv's scanner
+                architecture. Category allowlist rebuilt from scratch (does NOT
+                reuse Aptiv's professional-services allowlist -- see section 5
+                of the build spec). Score weights reweighted 35/25/20/20 (vs
+                Aptiv's 40/30/20/10) per Neal's call: B-BBEE/youth-ownership is
+                Youth Water's primary competitive edge, not a secondary bonus.
+                Feasibility rebuilt as a multi-province coverage model (Western
+                Cape / Eastern Cape / Gauteng) instead of Aptiv's single
+                HOME_PROVINCE model, since Youth Water delivers physical goods
+                across three provinces with no single stated HQ.
+2026-07-16 v1.1 Fix: fetch_tenders() was issuing a single API call capped at
+                length=300 with no pagination loop, silently dropping every
+                tender past the first page. Verified live on 2026-07-16 against
+                Aptiv's own scanner run in the same window: the portal returned
+                1,865 total advertised tenders, of which Youth Water's scanner
+                was only ever seeing the first 300 (~16%). Replaced with the
+                same paginated fetch loop Aptiv's scanner uses (500-record
+                pages, looping until recordsTotal is exhausted), so the two
+                scanners now have identical fetch coverage of the portal --
+                only scoring/category logic differs, per the 2026-07-15 design
+                decision above. No other behavior changed.
+2026-07-25 v1.2 Tightened scope per Neal's diagnosis: the scanner was surfacing
+                municipal/rural bulk-water and pipeline-style water
+                infrastructure tenders instead of genuine event bottled/tanker
+                water work -- i.e. right commodity (water), wrong tender type.
+                Added (a) a set of unambiguous water-infrastructure/civil-works
+                terms to the existing hard EXCLUSIONS list (pipeline, water
+                infrastructure, reticulation, water supply scheme, drought
+                relief, communal standpipe, yard connection, rehabilitation/
+                refurbishment of water) -- these never describe an events
+                contract, so a blanket exclusion is safe; and (b) a new
+                context-aware exclusion, is_bulk_infrastructure(), for the
+                genuinely ambiguous terms ("water tanker", "bulk water
+                supply", "potable water supply", "water carting") that
+                describe BOTH large-event tanker delivery AND municipal
+                drought-relief/rural household water-carting -- this only
+                excludes when that language co-occurs with a municipal/
+                rural-scale signal (ward, village, household, municipality,
+                informal settlement, etc.), so a genuine event/festival/
+                wedding/conference water-tanker tender still passes untouched.
+                No change to the category allowlist, service-match keyword
+                corpus, or scoring weights -- this is an additive exclusion
+                gate only, applied before scoring.
 
 OPEN ITEMS (see build spec section 10 -- confirm before treating output as final):
 - Youth Water's physical base/warehouse location is not stated in the source
-  docs; FEASIBILITY_PROVINCE_POINTS below treats all three coverage provinces
-  equally rather than weighting Western Cape higher for track record.
+docs; FEASIBILITY_PROVINCE_POINTS below treats all three coverage provinces
+equally rather than weighting Western Cape higher for track record.
 - Category allowlist (section 5) is built from the live eTenders Advanced
-  Search filter list as of 2026-07-15 -- re-verify periodically, categories on
-  government portals do get renamed/added.
+Search filter list as of 2026-07-15 -- re-verify periodically, categories on
+government portals do get renamed/added.
+- MUNICIPAL_SCALE_SIGNALS (added 2026-07-25) is a first pass at "this reads as
+municipal/rural scale" -- monitor the next few digests for false
+exclusions (a genuine large event tender that happens to mention a
+municipality by name as the venue location) and false admits (municipal
+tenders that don't use any of these exact words) and refine the list.
 """
 
 import hashlib
@@ -253,6 +280,57 @@ EXCLUSIONS = [
     "paving",
     "fencing",
     "landscaping",
+    # --- 2026-07-25 addition (v1.2) ------------------------------------------
+    # Unambiguous water-infrastructure/civil-works terms. These never describe
+    # an events bottled/tanker-water contract, so a blanket exclusion is safe
+    # here -- unlike the tanker/bulk-water terms below, which need context
+    # (see BULK_WATER_SIGNALS / is_bulk_infrastructure()).
+    "pipeline",
+    "water infrastructure",
+    "reticulation",
+    "rehabilitation of water",
+    "refurbishment of water",
+    "water supply scheme",
+    "drought relief",
+    "communal standpipe",
+    "yard connection",
+]
+
+# --- Context-aware exclusion: municipal/rural bulk & tanker water -----------
+# "water tanker(s)" / "bulk water supply" / "potable water supply" language
+# legitimately describes BOTH (a) a large open-air event needing tanker-
+# delivered water, and (b) a municipal drought-relief or rural household
+# water-carting contract -- eTenders' one-line descriptions read almost
+# identically for either. A blanket keyword exclusion would also kill genuine
+# event-tanker tenders (exactly the kind Youth Water wants). So this only
+# fires when bulk/tanker language co-occurs with a municipal/rural-scale
+# signal; a standalone "water tanker" next to "conference"/"wedding"/
+# "festival"/etc. still passes through normally. Added 2026-07-25 (v1.2) per
+# Neal's diagnosis: scanner was pulling in municipal/pipeline-style water
+# tenders instead of event bottled/tanker water.
+BULK_WATER_SIGNALS = [
+    "water tanker",
+    "water tankers",
+    "water tankering",
+    "bulk water supply",
+    "bulk water",
+    "potable water supply",
+    "water carting",
+]
+
+MUNICIPAL_SCALE_SIGNALS = [
+    "ward",
+    "village",
+    "villages",
+    "rural",
+    "household",
+    "households",
+    "informal settlement",
+    "municipality",
+    "municipal",
+    "community water",
+    "district municipality",
+    "local municipality",
 ]
 
 # ---------------------------------------------------------------------------
@@ -358,6 +436,18 @@ def _contains_any(haystack, needles):
 def is_excluded(text):
     return any(term in text for term in EXCLUSIONS)
 
+def is_bulk_infrastructure(text):
+    """True if bulk/tanker water language co-occurs with municipal/rural-scale
+    context -- i.e. this reads as a water-relief/infrastructure contract, not
+    an events tanker-rental job. See BULK_WATER_SIGNALS / MUNICIPAL_SCALE_
+    SIGNALS comment above (added 2026-07-25, v1.2). Precision-first: only
+    fires on the combination, not either list alone, so a genuine large-event
+    water-tanker tender (no ward/household/municipal-scale language) still
+    passes through to scoring."""
+    return bool(_contains_any(text, BULK_WATER_SIGNALS)) and bool(
+        _contains_any(text, MUNICIPAL_SCALE_SIGNALS)
+    )
+
 def passes_category_filter(tender, text):
     category = (tender.get("category") or "").strip()
     if category in CATEGORY_ALLOWLIST:
@@ -422,6 +512,8 @@ def score_tender(tender):
     text = f"{description} {category}".lower()
 
     if is_excluded(text):
+        return None
+    if is_bulk_infrastructure(text):
         return None
     if not passes_category_filter(tender, text):
         return None
