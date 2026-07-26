@@ -114,11 +114,6 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
 
 RECIPIENTS = [
     "nealtitus4823@gmail.com",
-    "keisha.ash@krosworx.co.za",
-    "liam.dalton@inkrow.co.za",
-    "keisha@youthwater.co.za",
-    "oliver.bailey@krosworx.co.za",
-    "prayleen.bailey1@gmail.com",
 ]
 
 # --- Scoring thresholds & weights -------------------------------------------
